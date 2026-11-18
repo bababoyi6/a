@@ -63,17 +63,43 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_existing_upgrade_regenerates_exports_without_rotating(self):
         save(self.stage / "node.json", {**self.node, "name": "我的 HY2"})
+        previous_versions = {"caddy": "v2.11.7", "sing-box": "v1.14.3", "lego": "v5.5.2"}
+        save(self.stage / "versions.json", previous_versions)
         changed = self.root / "candidate"
+        changed.mkdir()
+        save(changed / "versions.json", previous_versions)
         with patch.object(manager, "CURRENT", self.stage), patch.object(Path, "is_symlink", return_value=True), \
                 patch.object(manager, "current", return_value=self.stage), patch.object(manager, "probe"), \
                 patch.object(manager, "apt_policy"), patch.object(manager, "set_units"), patch.object(manager, "enable_units"), \
+                patch.object(manager.releases, "install_binary") as fetch, \
                 patch.object(manager, "copy_generation", return_value=changed), patch.object(manager, "write_generation") as write, \
                 patch.object(manager, "activate") as activate, patch.object(manager, "subscription"):
-            manager.install(types.SimpleNamespace(obfs=None))
+            manager.install(types.SimpleNamespace(obfs=None, arch="amd64"))
         deployed = write.call_args.args[1]
         self.assertEqual(deployed, {**self.node, "name": "我的 HY2"})
         self.assertEqual(model.subscription(deployed), model.subscription(self.node))
+        dependency = manager.read_json(manager.APP / "dependencies.lock.json")["dependencies"]["caddy"]
+        fetch.assert_called_once_with(dependency["assets"]["amd64"], "caddy", changed / "bin/caddy", self.root / "cache")
+        self.assertEqual(manager.read_json(changed / "versions.json"), {**previous_versions, "caddy": dependency["version"]})
+        self.assertEqual(manager.read_json(self.stage / "versions.json"), previous_versions)
         activate.assert_called_once()
+
+    def test_caddy_upgrade_does_not_downgrade_newer_version(self):
+        save(self.stage / "versions.json", {"caddy": "v9.0.0"})
+        self.assertIsNone(manager.pending_caddy_update(self.stage, "amd64"))
+
+    def test_manual_rollback_rejects_outdated_caddy(self):
+        previous = self.root / "generations" / "previous"
+        previous.mkdir(parents=True)
+        save(manager.STATE, {"previous": str(previous)})
+        save(previous / "node.json", self.node)
+        save(previous / "versions.json", {"caddy": "v2.11.7"})
+        save(self.stage / "node.json", self.node)
+        with patch.object(manager, "current", return_value=self.stage), \
+                patch.object(manager, "root_platform", return_value="amd64"), patch.object(manager, "activate") as activate:
+            with self.assertRaisesRegex(manager.Error, "Caddy"):
+                manager.rollback()
+        activate.assert_not_called()
 
     def test_invalid_install_options_are_rejected_before_platform_access(self):
         with patch.object(manager, "root_platform") as platform:

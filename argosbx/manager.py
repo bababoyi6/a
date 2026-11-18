@@ -929,6 +929,26 @@ def reality_keypair(binary):
     return private[1], public[1]
 
 
+def pending_caddy_update(deployment, arch):
+    versions = read_json(deployment / "versions.json")
+    lockdata = read_json(APP / "dependencies.lock.json")
+    releases.validate_lock(lockdata)
+    dependency = lockdata["dependencies"]["caddy"]
+    if releases.version_tuple(versions["caddy"]) < releases.version_tuple(dependency["version"]):
+        return dependency["assets"][arch], dependency["version"]
+    return None
+
+
+def stage_caddy_update(stage, update):
+    if update is None:
+        return
+    spec, version = update
+    releases.install_binary(spec, "caddy", stage / "bin/caddy", DATA / "cache")
+    versions = read_json(stage / "versions.json")
+    versions["caddy"] = version
+    save(stage / "versions.json", versions)
+
+
 def install(args):
     if CURRENT.is_symlink():
         old = current()
@@ -937,6 +957,7 @@ def install(args):
             raise Error("发现旧版节点；不自动迁移或覆盖")
         if args.obfs is not None and args.obfs != node.get("obfs", "none"):
             raise Error("已安装；请用 argosbx obfs 显式切换混淆模式")
+        caddy_update = pending_caddy_update(old, args.arch)
         apt_policy()
         changed = set_units()
         if os.environ.get("ARGOSBX_APP_DEPLOY"):
@@ -945,10 +966,11 @@ def install(args):
             probe(old)
         except (Error, OSError):
             print("现有节点异常，尝试修复本项目服务。")
-            repair()
+            repair(caddy_update=caddy_update)
         else:
-            if not current_exports(old, node):
+            if caddy_update or not current_exports(old, node):
                 stage = copy_generation(old)
+                stage_caddy_update(stage, caddy_update)
                 write_generation(stage, node, old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
                 activate(stage, read_json(STATE))
         enable_units(changed)
@@ -1098,6 +1120,8 @@ def rollback():
     if ({key: value for key, value in oldnode.items() if key != "name"} !=
             {key: value for key, value in newnode.items() if key != "name"}):
         raise Error("上一版本含旧凭据；为避免恢复已撤销密码，不能普通回滚，请使用 repair 或再次 rotate")
+    if pending_caddy_update(stage, root_platform()):
+        raise Error("上一版本含低于当前安全基线的 Caddy，已拒绝手动回滚")
     if not current_exports(stage, newnode):
         original = stage
         stage = copy_generation(original)
@@ -1158,11 +1182,12 @@ def renew(scheduled=False):
     print("证书已校验并部署，服务完成短暂重启。")
 
 
-def repair():
+def repair(caddy_update=None):
     preflight()
     old = current()
     state = read_json(STATE)
     stage = copy_generation(old)
+    stage_caddy_update(stage, caddy_update)
     write_generation(stage, read_json(old / "node.json"), old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
     try:
         verify_firewall()

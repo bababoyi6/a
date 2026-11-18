@@ -51,9 +51,10 @@ class DualTests(unittest.TestCase):
              patch.object(manager, "probe"), \
              patch.object(manager, "apt_policy"), patch.object(manager, "set_units"), \
              patch.object(manager, "enable_units"), patch.object(manager, "current_exports", return_value=True), \
+             patch.object(manager, "pending_caddy_update", return_value=None), \
              patch.object(manager, "preflight", side_effect=AssertionError("reinstall changed system")), \
              patch.object(manager, "subscription", return_value="existing"):
-            self.assertEqual(manager.install(types.SimpleNamespace(obfs=None)), "existing")
+            self.assertEqual(manager.install(types.SimpleNamespace(obfs=None, arch="amd64")), "existing")
 
     def test_qr_encoder_receives_exact_subscription_url(self):
         output = io.StringIO()

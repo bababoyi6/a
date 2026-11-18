@@ -11,7 +11,7 @@
 
 ## 安装
 
-当前是 v0.3.0 候选版。远程安装入口尚未启用；把审查过的完整源码传到 VPS，在源码目录执行：
+从 [GitHub Releases](https://github.com/bababoyi6/a/releases) 查看安装包与验证状态。也可以把审查过的完整源码传到 VPS，在源码目录执行：
 
 ```bash
 sudo bash install.sh
@@ -25,7 +25,7 @@ https://node.example.com:8443/s/<随机Token>
 <终端二维码>
 ```
 
-将同一个链接粘贴到 Clash Verge Rev 或 Shadowrocket 的订阅导入框。v0.3.0 候选版统一显示为 `VLESS`（TCP 443，主用）和 `Hysteria2`（UDP 443，备用）；Clash 保留手动 `PROXY`，没有自动换线。sing-box 可加 `?format=singbox`，默认出口为 VLESS。在 SSH 终端输入 `aaa` 可重新显示链接及二维码。
+将同一个链接粘贴到 Clash Verge Rev 或 Shadowrocket 的订阅导入框。v0.3.0 统一显示为 `VLESS`（TCP 443，主用）和 `Hysteria2`（UDP 443，备用）；Clash 保留手动 `PROXY`，没有自动换线。sing-box 可加 `?format=singbox`，默认出口为 VLESS。在 SSH 终端输入 `aaa` 可重新显示链接及二维码。
 
 ## 日常维护
 
@@ -37,7 +37,7 @@ sudo argosbx repair          # 必要时修复本项目服务
 sudo argosbx uninstall       # 卸载服务并恢复项目管理的网络改动
 ```
 
-v0.3.0 候选版的维护策略：
+v0.3.0 的维护策略：
 
 - systemd 对进程失败按 5 秒延迟重试，保留 300 秒内最多 8 次启动的限制。健康任务每分钟查进程、监听、证书和自有防火墙；每约 5 分钟分别探测两种协议。`EXTERNAL_UNKNOWN` 表示不能确认转发，不会仅为外网故障重启服务。
 - 同一故障连查两次后才自愈；失败按 2、5、10、20、30 分钟退避，滚动 24 小时内最多 8 次健康任务发起的重启或规则重建。额度耗尽仍继续检查，不重启 VPS。
@@ -47,10 +47,10 @@ v0.3.0 候选版的维护策略：
 - `install --obfs salamander` 仅用于显式启用，默认不启用；已安装后通过 `argosbx obfs` 切换。只支持 `--challenge http`，拒绝 `--name`、`--token-file`。
 - `argosbx rotate token` 只换订阅 URL；`rotate password` 只换 Hysteria2 密码及已启用的混淆密码；`rotate both` 同时撤销两协议旧凭据并更换 Token。普通版本回滚不能恢复已撤销凭据。
 
-## v0.3.0 候选版升级与发布
+## v0.3.0 升级与发布
 
 已安装 v0.2.0 双协议节点的用户，可在校验 v0.3.0 包外 SHA-256 与包内 `MANIFEST.sha256` 后，从解包目录运行 `sudo bash install.sh`。无需传域名、重装服务或重新导入订阅；原 URL、Token、UUID、REALITY 密钥及 HY2 凭据不变。旧的单协议 HY2 安装不自动迁移。
 
-维护者可运行 `python3 tools/make_release.py --repo OWNER/REPO` 生成候选包、SHA-256 和候选 `dist/quick.sh`，将 `OWNER/REPO` 换成当前仓库全名。先让 Debian 13 检查通过并验证新装、升级和回滚；正式上传并重新下载哈希校验后，才用生成的脚本启用公开安装入口。
+维护者可运行 `python3 tools/make_release.py --repo OWNER/REPO` 生成发布包、SHA-256 和 `dist/quick.sh`，将 `OWNER/REPO` 换成当前仓库全名。正式上传并重新下载哈希校验后，才用生成的脚本启用公开安装入口。
 
 Debian 13 CI 检查配置、订阅及隔离的真实协议行为，不代表生产 VPS 已通过验收。公网 UDP、真实证书签发、实际客户端、跨境吞吐和长期运行需单独验证。
