@@ -11,7 +11,13 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/bababoyi6/a/releases) 查看安装包与验证状态。也可以把审查过的完整源码传到 VPS，在源码目录执行：
+先查看 [v0.3.0 发布说明](https://github.com/bababoyi6/a/releases/tag/v0.3.0) 的支持范围和验证状态。在符合要求的 VPS 上，下载固定版本的安装器再运行：
+
+```bash
+curl -fsSLo quick.sh https://github.com/bababoyi6/a/releases/download/v0.3.0/quick.sh && bash quick.sh
+```
+
+安装器会校验发行包的 SHA-256 和包内清单。也可以把审查过的完整源码传到 VPS，在源码目录执行：
 
 ```bash
 sudo bash install.sh
