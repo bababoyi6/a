@@ -230,22 +230,22 @@ def reserve_health_recovery(layout, tx):
     return True
 
 
-def restore_new_udp(layout, tx):
-    journal = layout.etc / 'udp-sysctl.json'
+def restore_new_sysctls(layout, tx, filename, keys):
+    journal = layout.etc / filename
     if not journal.is_file() or journal.is_symlink():
         return
     original = tx['files'].get(str(journal))
     old = json.loads(base64.b64decode(original['data'], validate=True)) if original else {}
     candidate = json.loads(journal.read_text())
-    for key in ('net.core.rmem_max', 'net.core.wmem_max'):
+    for key in keys:
         record = candidate.get(key)
         if key in old or not record or record.get('released'):
             continue
-        value = command(['sysctl', '-n', key], False).stdout.decode().strip()
-        if value == str(record['after']):
+        value = command(['sysctl', '-n', key], False).stdout.decode().split()
+        if value == str(record['after']).split():
             command(['sysctl', '-w', f"{key}={record['before']}"])
-            if command(['sysctl', '-n', key]).stdout.strip() != str(record['before']).encode():
-                raise RuntimeError('无法确认 UDP 缓冲区已还原')
+            if command(['sysctl', '-n', key]).stdout.decode().split() != str(record['before']).split():
+                raise RuntimeError('无法确认网络参数已还原')
 
 
 def unchanged_runtime(layout, tx):
@@ -303,7 +303,9 @@ def recover(layout, tx, context=''):
             if stale:
                 command(['systemctl', 'disable', *stale], False)
         if tx['phase'] != 'runtime_pending' or not deferred:
-            restore_new_udp(layout, tx)
+            restore_new_sysctls(layout, tx, 'udp-sysctl.json', ('net.core.rmem_max', 'net.core.wmem_max'))
+            restore_new_sysctls(layout, tx, 'tcp-sysctl.json',
+                                ('net.ipv4.tcp_wmem', 'net.ipv4.tcp_mtu_probing', 'net.ipv4.tcp_fastopen'))
             restore_files(layout, tx)
         for path in layout.managed[:2]:
             if path.exists() and path.parent.name == 'sysctl.d':
@@ -447,7 +449,7 @@ def main():
                 fcntl.flock(stream, fcntl.LOCK_UN)
                 with locked(layout.base / 'app.lock') as recovery_stream:
                     if layout.journal.exists():
-                        if args and (args[0] in ('status', 'subscription', 'check-update', 'renew') or
+                        if args and (args[0] in ('status', 'subscription', 'check-update', 'renew', 'netdiag') or
                                      args[0] == 'health' and '--heal' not in args):
                             if args[0] == 'renew' and '--scheduled' in args:
                                 return

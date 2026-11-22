@@ -9,7 +9,9 @@ from urllib.parse import quote
 
 ROOT = "/etc/argosbx-hy2/current"
 VLESS = "VLESS"
+VLESS_FAST_OPEN = "VLESS Fast Open"
 HYSTERIA2 = "Hysteria2"
+AUTO = "AUTO"
 # Explicitly includes multicast, CGNAT, documentation, mapped IPv4 and metadata.
 BLOCKED = [
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -35,9 +37,21 @@ def domain_name(value):
     raise ValueError("第一版使用域名证书，请勿填写 IP")
 
 
+def endpoint_ipv4(value):
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        raise ValueError("节点地址必须是公网 IPv4，或用 domain 恢复域名") from None
+    if not address.is_global or address.is_multicast:
+        raise ValueError("节点地址必须是公网单播 IPv4")
+    return str(address)
+
+
 def validate_node(node):
     if domain_name(node["domain"]) != node["domain"]:
         raise ValueError("元数据域名必须使用规范形式")
+    if "endpoint_ip" in node and endpoint_ipv4(node["endpoint_ip"]) != node["endpoint_ip"]:
+        raise ValueError("节点 IPv4 必须使用规范形式")
     for key in ("password", "token"):
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", node[key]):
             raise ValueError(f"无效的 {key}（要求 32 字节随机值）")
@@ -87,7 +101,7 @@ def subscription(node):
 
 def vless_uri(node):
     validate_node(node)
-    return (f'vless://{node["uuid"]}@{node["domain"]}:443?encryption=none&security=reality'
+    return (f'vless://{node["uuid"]}@{node.get("endpoint_ip", node["domain"])}:443?encryption=none&security=reality'
             f'&sni=addons.mozilla.org&fp=chrome&pbk={node["reality_public"]}'
             f'&sid={node["short_id"]}&flow=xtls-rprx-vision&type=tcp&packetEncoding=xudp'
             f'#{VLESS}')
@@ -97,7 +111,7 @@ def uri(node):
     validate_node(node)
     obfs = ("&obfs=salamander&obfs-password=" + quote(node["obfs_password"], safe="")
             if node.get("obfs") == "salamander" else "")
-    return (f'hysteria2://{quote(node["password"], safe="")}@{node["domain"]}:443/'
+    return (f'hysteria2://{quote(node["password"], safe="")}@{node.get("endpoint_ip", node["domain"])}:443/'
             f'?sni={node["domain"]}&insecure=0{obfs}#{HYSTERIA2}')
 
 
@@ -107,6 +121,7 @@ def server_config(node, root=ROOT):
         "log": {"level": "error", "timestamp": True},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": [{"type": "vless", "tag": "vless-in", "listen": "0.0.0.0", "listen_port": 443,
+                      "tcp_fast_open": True,
                       "users": [{"name": "personal", "uuid": node["uuid"], "flow": "xtls-rprx-vision"}],
                       "tls": {"enabled": True, "server_name": "addons.mozilla.org",
                               "reality": {"enabled": True,
@@ -128,19 +143,26 @@ def server_config(node, root=ROOT):
     }
 
 
+def vless_outbound(node, endpoint, tag):
+    return {"type": "vless", "tag": tag, "server": endpoint, "server_port": 443,
+            "uuid": node["uuid"], "flow": "xtls-rprx-vision", "packet_encoding": "xudp",
+            "tls": {"enabled": True, "server_name": "addons.mozilla.org",
+                    "utls": {"enabled": True, "fingerprint": "chrome"},
+                    "reality": {"enabled": True, "public_key": node["reality_public"], "short_id": node["short_id"]}}}
+
+
 def client_config(node):
+    validate_node(node)
+    endpoint = node.get("endpoint_ip", node["domain"])
     return {
         "log": {"level": "warn"},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": [{"type": "mixed", "tag": "local-in", "listen": "127.0.0.1", "listen_port": 7890}],
-        "outbounds": [{"type": "vless", "tag": VLESS, "server": node["domain"],
-                       "server_port": 443, "uuid": node["uuid"], "flow": "xtls-rprx-vision",
-                       "packet_encoding": "xudp", "tls": {"enabled": True,
-                       "server_name": "addons.mozilla.org", "utls": {"enabled": True, "fingerprint": "chrome"},
-                       "reality": {"enabled": True, "public_key": node["reality_public"], "short_id": node["short_id"]}}},
-                      {"type": "hysteria2", "tag": HYSTERIA2, "server": node["domain"],
+        "outbounds": [vless_outbound(node, endpoint, VLESS),
+                      {"type": "hysteria2", "tag": HYSTERIA2, "server": endpoint,
                        "server_port": 443, "password": node["password"], **obfuscation(node),
-                       "tls": {"enabled": True, "server_name": node["domain"], "insecure": False}}],
+                       "tls": {"enabled": True, "server_name": node["domain"], "insecure": False}},
+                      {**vless_outbound(node, endpoint, VLESS_FAST_OPEN), "tcp_fast_open": True}],
         "route": {"default_domain_resolver": "local", "final": VLESS},
     }
 
@@ -149,8 +171,29 @@ def clash_config(node):
     validate_node(node)
     # JSON quoted strings are valid YAML scalars; never interpolate raw user text.
     q = lambda value: json.dumps(value, ensure_ascii=False)
+    endpoint = q(node.get("endpoint_ip", node["domain"]))
     obfs = ('    obfs: salamander\n    obfs-password: ' + q(node["obfs_password"]) + '\n'
             if node.get("obfs") == "salamander" else '')
+
+    def vless_proxy(name, tfo=""):
+        return f'''  - name: "{name}"
+    type: vless
+    server: {endpoint}
+    port: 443
+    uuid: {q(node["uuid"])}
+    network: tcp
+{tfo}    udp: true
+    packet-encoding: xudp
+    tls: true
+    servername: addons.mozilla.org
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: {q(node["reality_public"])}
+      short-id: {q(node["short_id"])}
+    flow: xtls-rprx-vision
+'''
+
+    fast_open = vless_proxy(VLESS_FAST_OPEN, "    tfo: true\n")
     return f'''# ArgoSBX-HY2 — Mihomo; local mixed proxy at 127.0.0.1:7890
 mixed-port: 7890
 allow-lan: false
@@ -168,32 +211,26 @@ dns:
   proxy-server-nameserver: [https://dns.alidns.com/dns-query, https://doh.pub/dns-query]
   nameserver: [https://1.1.1.1/dns-query, https://8.8.8.8/dns-query]
 proxies:
-  - name: "{VLESS}"
-    type: vless
-    server: {q(node["domain"])}
-    port: 443
-    uuid: {q(node["uuid"])}
-    network: tcp
-    udp: true
-    packet-encoding: xudp
-    tls: true
-    servername: addons.mozilla.org
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: {q(node["reality_public"])}
-      short-id: {q(node["short_id"])}
-    flow: xtls-rprx-vision
-  - name: "{HYSTERIA2}"
+{vless_proxy(VLESS)}  - name: "{HYSTERIA2}"
     type: hysteria2
-    server: {q(node["domain"])}
+    server: {endpoint}
     port: 443
     password: {q(node["password"])}
 {obfs}    sni: {q(node["domain"])}
     skip-cert-verify: false
-proxy-groups:
+{fast_open}proxy-groups:
   - name: PROXY
     type: select
+    proxies: ["{AUTO}", "{VLESS}", "{VLESS_FAST_OPEN}", "{HYSTERIA2}"]
+  - name: {AUTO}
+    type: fallback
     proxies: ["{VLESS}", "{HYSTERIA2}"]
+    url: https://www.gstatic.com/generate_204
+    expected-status: 204
+    interval: 120
+    timeout: 5000
+    max-failed-times: 2
+    lazy: true
 rules:
   - MATCH,PROXY
 '''
@@ -292,8 +329,12 @@ https://{node["domain"]}:8443 {{
         X-Content-Type-Options nosniff
         Referrer-Policy no-referrer
     }}
+    @subscription {{
+        method GET HEAD
+        path_regexp ^{path}$
+    }}
     route {{
-        handle {path} {{
+        handle @subscription {{
             header {{
                 Cache-Control "private, no-store"
                 >Vary "User-Agent, Accept-Encoding"

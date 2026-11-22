@@ -270,7 +270,7 @@ def dns_preflight(node, token=None, server_ip=None):
             raise Error("域名必须使用直接 A 记录，不接受 CNAME") from None
         verify_server_address(address, server_ip)
         print(f"公共 DNS 检查通过：{domain} → {address}")
-        return
+        return str(address)
     # Check the exact dedicated record through Cloudflare, without changing A/AAAA.
     import urllib.parse
     import urllib.request
@@ -929,23 +929,23 @@ def reality_keypair(binary):
     return private[1], public[1]
 
 
-def pending_caddy_update(deployment, arch):
-    versions = read_json(deployment / "versions.json")
+def pending_caddy_update(deployment):
+    installed = read_json(deployment / "versions.json")["caddy"]
     lockdata = read_json(APP / "dependencies.lock.json")
     releases.validate_lock(lockdata)
     dependency = lockdata["dependencies"]["caddy"]
-    if releases.version_tuple(versions["caddy"]) < releases.version_tuple(dependency["version"]):
-        return dependency["assets"][arch], dependency["version"]
+    if releases.version_tuple(installed) < releases.version_tuple(dependency["version"]):
+        return dependency
     return None
 
 
-def stage_caddy_update(stage, update):
-    if update is None:
+def stage_caddy_update(stage, dependency):
+    if dependency is None:
         return
-    spec, version = update
+    spec = dependency["assets"][root_platform()]
     releases.install_binary(spec, "caddy", stage / "bin/caddy", DATA / "cache")
     versions = read_json(stage / "versions.json")
-    versions["caddy"] = version
+    versions["caddy"] = dependency["version"]
     save(stage / "versions.json", versions)
 
 
@@ -957,22 +957,23 @@ def install(args):
             raise Error("发现旧版节点；不自动迁移或覆盖")
         if args.obfs is not None and args.obfs != node.get("obfs", "none"):
             raise Error("已安装；请用 argosbx obfs 显式切换混淆模式")
-        caddy_update = pending_caddy_update(old, args.arch)
+        caddy_update = pending_caddy_update(old)
         apt_policy()
         changed = set_units()
+        force = set(SERVICES).intersection(changed)
         if os.environ.get("ARGOSBX_APP_DEPLOY"):
             tune()
         try:
             probe(old)
         except (Error, OSError):
             print("现有节点异常，尝试修复本项目服务。")
-            repair(caddy_update=caddy_update)
+            repair(force=force)
         else:
-            if caddy_update or not current_exports(old, node):
+            if caddy_update or force or not current_exports(old, node):
                 stage = copy_generation(old)
                 stage_caddy_update(stage, caddy_update)
                 write_generation(stage, node, old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
-                activate(stage, read_json(STATE))
+                activate(stage, read_json(STATE), force=force)
         enable_units(changed)
         print("检测到已安装，保留现有服务和凭据。")
         return subscription() if not os.environ.get("ARGOSBX_APP_DEPLOY") else None
@@ -1058,6 +1059,7 @@ def status():
     try:
         print("系统网络：" + json.dumps(network.check(run), ensure_ascii=False))
         print("UDP 缓冲区：" + json.dumps({key: network.buffer_value(run, key) for key in network.UDP_KEYS}))
+        print("TCP 设置：" + json.dumps({key: network.tcp_value(run, key) for key in network.TCP_KEYS}))
     except ValueError as exc:
         print("系统网络：" + str(exc))
     if state.get("blocked_version"):
@@ -1117,11 +1119,12 @@ def rollback():
     # Never restore revoked credentials through an ordinary binary rollback.
     oldnode = read_json(current() / "node.json")
     newnode = read_json(stage / "node.json")
-    if ({key: value for key, value in oldnode.items() if key != "name"} !=
-            {key: value for key, value in newnode.items() if key != "name"}):
+    non_credentials = {"name", "endpoint_ip"}
+    if ({key: value for key, value in oldnode.items() if key not in non_credentials} !=
+            {key: value for key, value in newnode.items() if key not in non_credentials}):
         raise Error("上一版本含旧凭据；为避免恢复已撤销密码，不能普通回滚，请使用 repair 或再次 rotate")
-    if pending_caddy_update(stage, root_platform()):
-        raise Error("上一版本含低于当前安全基线的 Caddy，已拒绝手动回滚")
+    if pending_caddy_update(stage):
+        raise Error("上一版本的 Caddy 低于当前安全版本，拒绝回滚")
     if not current_exports(stage, newnode):
         original = stage
         stage = copy_generation(original)
@@ -1132,9 +1135,10 @@ def rollback():
 
 
 def current_exports(stage, node):
-    return all((stage / "exports" / name).is_file() and
-               (stage / "exports" / name).read_text(encoding="utf-8") == content
-               for name, content in model.exports(node).items())
+    files = {f"exports/{name}": content for name, content in model.exports(node).items()}
+    files["Caddyfile"] = model.caddy_config(node, ua_rules=read_json(stage / "ua.json", []))
+    return all((stage / name).is_file() and (stage / name).read_text(encoding="utf-8") == content
+               for name, content in files.items())
 
 
 def renew(scheduled=False):
@@ -1182,12 +1186,12 @@ def renew(scheduled=False):
     print("证书已校验并部署，服务完成短暂重启。")
 
 
-def repair(caddy_update=None):
+def repair(force=()):
     preflight()
     old = current()
     state = read_json(STATE)
     stage = copy_generation(old)
-    stage_caddy_update(stage, caddy_update)
+    stage_caddy_update(stage, pending_caddy_update(old))
     write_generation(stage, read_json(old / "node.json"), old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
     try:
         verify_firewall()
@@ -1196,12 +1200,12 @@ def repair(caddy_update=None):
     tune()
     ingress(state.get("firewall_external", False))
     changed = set_units()
-    force = []
+    force = set(SERVICES).intersection(changed).union(force)
     for service, check in zip(SERVICES, (check_proxy_listeners, lambda: probe_web(old))):
         try:
             check()
         except (Error, OSError):
-            force.append(service)
+            force.add(service)
     activate(stage, state, force=force)
     enable_units(changed)
     print("已重新生成配置并修复服务，凭据保持不变。")
@@ -1248,6 +1252,25 @@ def set_obfuscation(mode):
     activate(stage, read_json(STATE))
     print("模式已切换；请在两个客户端刷新原订阅。此模式不保证绕过所有识别或封锁。")
     subscription()
+
+
+def set_endpoint(value):
+    old = current()
+    node = read_json(old / "node.json")
+    address = None if value == "domain" else model.endpoint_ipv4(value)
+    if node.get("endpoint_ip") == address:
+        print("客户端节点地址：" + (address or node["domain"]))
+        return
+    if address:
+        if dns_preflight(node, server_ip=address) != address:
+            raise Error("固定 IPv4 必须与当前域名的公网 A 记录一致")
+        node["endpoint_ip"] = address
+    else:
+        node.pop("endpoint_ip")
+    stage = copy_generation(old)
+    write_generation(stage, node, old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
+    activate(stage, read_json(STATE))
+    print("客户端节点地址已更新，请刷新原订阅。")
 
 
 def add_ua(args):
@@ -1559,6 +1582,10 @@ def main(argv=None):
     sub.add_parser("renew").add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     health_parser = sub.add_parser("health")
     health_parser.add_argument("--heal", action="store_true", help="连续失败后限次恢复本项目服务、规则与网络参数")
+    diag = sub.add_parser("netdiag", help="只读采样 VPS 网卡、CPU、TCP 和 UDP 计数")
+    diag.add_argument("--seconds", type=int, default=10, help="采样秒数，1–120")
+    endpoint = sub.add_parser("endpoint", help="固定客户端连接 IPv4，或恢复通过域名连接")
+    endpoint.add_argument("address", metavar="IPv4|domain")
     rot = sub.add_parser("rotate")
     rot.add_argument("kind", choices=["token", "password", "both"], default="both", nargs="?")
     transport = sub.add_parser("obfs", help="切换传输模式，保留订阅地址；客户端需要刷新")
@@ -1572,9 +1599,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "install" and (args.name is not None or args.token_file is not None):
         ins.error("不支持 --name 或 --token-file；节点名固定，证书仅使用 HTTP-01")
+    if args.command == "netdiag" and not 1 <= args.seconds <= 120:
+        diag.error("--seconds 必须在 1–120 之间")
     had_current = CURRENT.is_symlink()
     try:
         args.arch = root_platform()
+        if args.command == "netdiag":
+            print(json.dumps(network.diagnostics(run, args.seconds), ensure_ascii=False, indent=2))
+            return 0
         os.umask(0o077)
         # systemd starts the guard while activation holds the lifecycle lock.
         # Its own lock serializes nft changes without deadlocking activation.
@@ -1619,6 +1651,8 @@ def main(argv=None):
                 rotate(args.kind)
             elif command == "obfs":
                 set_obfuscation(args.mode)
+            elif command == "endpoint":
+                set_endpoint(args.address)
             elif command == "add-ua":
                 add_ua(args)
             elif command == "uninstall":

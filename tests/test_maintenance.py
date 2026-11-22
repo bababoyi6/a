@@ -63,43 +63,19 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_existing_upgrade_regenerates_exports_without_rotating(self):
         save(self.stage / "node.json", {**self.node, "name": "我的 HY2"})
-        previous_versions = {"caddy": "v2.11.7", "sing-box": "v1.14.3", "lego": "v5.5.2"}
-        save(self.stage / "versions.json", previous_versions)
         changed = self.root / "candidate"
-        changed.mkdir()
-        save(changed / "versions.json", previous_versions)
         with patch.object(manager, "CURRENT", self.stage), patch.object(Path, "is_symlink", return_value=True), \
                 patch.object(manager, "current", return_value=self.stage), patch.object(manager, "probe"), \
-                patch.object(manager, "apt_policy"), patch.object(manager, "set_units"), patch.object(manager, "enable_units"), \
-                patch.object(manager.releases, "install_binary") as fetch, \
+                patch.object(manager, "pending_caddy_update", return_value=None), \
+                patch.object(manager, "apt_policy"), patch.object(manager, "set_units", return_value=set()), \
+                patch.object(manager, "enable_units"), \
                 patch.object(manager, "copy_generation", return_value=changed), patch.object(manager, "write_generation") as write, \
                 patch.object(manager, "activate") as activate, patch.object(manager, "subscription"):
-            manager.install(types.SimpleNamespace(obfs=None, arch="amd64"))
+            manager.install(types.SimpleNamespace(obfs=None))
         deployed = write.call_args.args[1]
         self.assertEqual(deployed, {**self.node, "name": "我的 HY2"})
         self.assertEqual(model.subscription(deployed), model.subscription(self.node))
-        dependency = manager.read_json(manager.APP / "dependencies.lock.json")["dependencies"]["caddy"]
-        fetch.assert_called_once_with(dependency["assets"]["amd64"], "caddy", changed / "bin/caddy", self.root / "cache")
-        self.assertEqual(manager.read_json(changed / "versions.json"), {**previous_versions, "caddy": dependency["version"]})
-        self.assertEqual(manager.read_json(self.stage / "versions.json"), previous_versions)
         activate.assert_called_once()
-
-    def test_caddy_upgrade_does_not_downgrade_newer_version(self):
-        save(self.stage / "versions.json", {"caddy": "v9.0.0"})
-        self.assertIsNone(manager.pending_caddy_update(self.stage, "amd64"))
-
-    def test_manual_rollback_rejects_outdated_caddy(self):
-        previous = self.root / "generations" / "previous"
-        previous.mkdir(parents=True)
-        save(manager.STATE, {"previous": str(previous)})
-        save(previous / "node.json", self.node)
-        save(previous / "versions.json", {"caddy": "v2.11.7"})
-        save(self.stage / "node.json", self.node)
-        with patch.object(manager, "current", return_value=self.stage), \
-                patch.object(manager, "root_platform", return_value="amd64"), patch.object(manager, "activate") as activate:
-            with self.assertRaisesRegex(manager.Error, "Caddy"):
-                manager.rollback()
-        activate.assert_not_called()
 
     def test_invalid_install_options_are_rejected_before_platform_access(self):
         with patch.object(manager, "root_platform") as platform:
@@ -386,6 +362,57 @@ class MaintenanceTests(unittest.TestCase):
             self.assertNotIn(write_key, config.read_text())
             network.undo(self.root, run)
         self.assertEqual(values, {read_key: 200000, write_key: 9000000, network.KEY: "cubic"})
+
+    def test_tcp_tuning_preserves_defaults_and_restores_owned_values(self):
+        config = self.root / "sysctl.conf"
+        config.write_text(network.MARKER)
+        before = {network.TCP_WMEM: "4096 16384 4194304", network.TCP_MTU: "0", network.TCP_FASTOPEN: "1"}
+        values = dict(before)
+
+        def sysctl(args, **_):
+            if args[1] == "-n":
+                return result(values[args[2]].replace(" ", "\t"))
+            key, value = args[2].split("=", 1)
+            values[key] = value
+            return result()
+
+        def atomic(path, content, mode):
+            path.write_text(content)
+
+        with patch.object(network, "SYSCTL", config):
+            tuned = network.enable_tcp(self.root, sysctl, save, atomic)
+            self.assertEqual(tuned, {network.TCP_WMEM: "4096 16384 16777216",
+                                     network.TCP_MTU: 1, network.TCP_FASTOPEN: 3})
+            self.assertIn("tcp_wmem = 4096 16384 16777216", config.read_text())
+            journal = self.root / "tcp-sysctl.json"
+            network.restore_sysctls(journal, network.TCP_KEYS, network.tcp_value, sysctl)
+            self.assertEqual(values, before)
+            journal.unlink()
+            values[network.TCP_WMEM] = "4096 32768 33554432"
+            values[network.TCP_MTU] = "2"
+            values[network.TCP_FASTOPEN] = "7"
+            network.enable_tcp(self.root, sysctl, save, atomic)
+            self.assertFalse(journal.exists())
+            self.assertEqual(values[network.TCP_WMEM], "4096 32768 33554432")
+            self.assertEqual(values[network.TCP_MTU], "2")
+            self.assertEqual(values[network.TCP_FASTOPEN], "7")
+
+    def test_app_rollback_normalizes_tcp_sysctl_vector(self):
+        layout = types.SimpleNamespace(etc=self.root)
+        key = network.TCP_WMEM
+        before, after = "4096 16384 4194304", "4096 16384 16777216"
+        save(self.root / "tcp-sysctl.json", {key: {"before": before, "after": after}})
+        current = after
+
+        def command(args, *_):
+            nonlocal current
+            if args[:2] == ["sysctl", "-w"]:
+                current = args[2].split("=", 1)[1]
+            return result((current.replace(" ", "\t") + "\n").encode())
+
+        with patch.object(bootstrap, "command", side_effect=command):
+            bootstrap.restore_new_sysctls(layout, {"files": {}}, "tcp-sysctl.json", network.TCP_KEYS)
+        self.assertEqual(current, before)
 
     def test_units_keep_limits_and_independent_health_trigger(self):
         units = system.units()

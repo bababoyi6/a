@@ -81,7 +81,7 @@ def socks(port, host, target_port):
         yield sock
 
 
-def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
+def smoke(sb, caddy, openssl, external=False, obfs="none", mihomo=None):
     processes = []
     with tempfile.TemporaryDirectory(prefix="ahy2-runtime-") as tmp:
         root = Path(tmp)
@@ -105,6 +105,9 @@ def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
         web = model.caddy_config(node, root.as_posix(), [{"pattern": "Verified-Mihomo/test*", "format": "clash"}])
         web = web.replace("https://node.example.com:8443 {", f"https://node.example.com:{tcp_port} {{\n  bind 127.0.0.1")
         web = web.replace("/var/lib/argosbx-hy2/public", (root / "public").as_posix())
+        if mihomo:
+            probe_port = free_port()
+            web += f"\nhttp://127.0.0.1:{probe_port} {{\n  bind 127.0.0.1\n  respond /generate_204 204\n}}\n"
         (root / "Caddyfile").write_text(web, encoding="utf-8")
         server = model.server_config(node, root.as_posix())
         server["inbounds"][0]["listen_port"] = free_port()
@@ -117,11 +120,15 @@ def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
         # without depending on an external network. Production has no such rule.
         server["route"]["rules"].insert(1, {"ip_cidr": ["127.0.0.1/32"], "port": tcp_port,
                                            "action": "route", "outbound": "direct"})
+        if mihomo:
+            server["route"]["rules"].insert(1, {"ip_cidr": ["127.0.0.1/32"], "port": probe_port,
+                                               "action": "route", "outbound": "direct"})
         server['route']['rules'].insert(1, {'ip_cidr': ['127.0.0.1/32'], 'port': echo_port,
                                            'action': 'route', 'outbound': 'direct'})
         vless_client = model.client_config(node)
         vless_client["inbounds"][0]["listen_port"] = vless_port
         vless_client["outbounds"] = [vless_client["outbounds"][0]]
+        vless_client["route"]["final"] = model.VLESS
         vless_client["outbounds"][0].update(server="127.0.0.1", server_port=server["inbounds"][0]["listen_port"])
         client = model.client_config(node)
         client["outbounds"] = [client["outbounds"][1]]
@@ -138,11 +145,11 @@ def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
                             [sb, "run", "-c", str(root / "client.json")],
                             [sb, "run", "-c", str(root / "vless-client.json")]]:
                 processes.append(subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-            def request(path, ua="Unknown/test", ctx=context):
+            def request(path, ua="Unknown/test", ctx=context, method="GET"):
                 conn = http.client.HTTPSConnection("node.example.com", tcp_port, context=ctx, timeout=5)
                 conn._create_connection = lambda address, timeout, source_address=None: socket.create_connection(("127.0.0.1", tcp_port), timeout)
                 try:
-                    conn.request("GET", path, headers={"User-Agent": ua})
+                    conn.request(method, path, headers={"User-Agent": ua})
                     res = conn.getresponse()
                     return res.status, dict((k.lower(), v) for k, v in res.getheaders()), res.read()
                 finally:
@@ -173,6 +180,9 @@ def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
             assert request(path, "Verified-Mihomo/test1")[2] == (root / "exports/clash.yaml").read_bytes()
             assert request(path + "?format=shadowrocket", "Verified-Mihomo/test1")[2] == (root / "exports/shadowrocket.txt").read_bytes()
             assert request(path + "?format=unknown", "Verified-Mihomo/test1")[2] == (root / "exports/index.html").read_bytes()
+            assert request(path, method="HEAD")[0] == 200
+            assert request(path, method="POST")[0] == 404
+            assert request(path.replace("/s/", "/S/"))[0] == 404
             for illegal in ("/s/bad", "/clash.yaml", "/exports/clash.yaml", "/tls/key.pem", "/node.json"):
                 assert request(illegal)[0] == 404, illegal
             try:
@@ -254,8 +264,11 @@ def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
                 # Test-only CA pin verifies chain/name without changing system trust.
                 pin=hashlib.sha256(ssl.PEM_cert_to_DER_cert(ca.read_text())).hexdigest()
                 yaml=model.clash_config(node).replace('mixed-port: 7890',f'mixed-port: {mhport}')
-                yaml=yaml.replace('server: "node.example.com"','server: "127.0.0.1"').replace('    port: 443',f'    port: {udp_port}')
-                yaml=yaml.replace('proxies: ["VLESS", "Hysteria2"]','proxies: ["Hysteria2", "VLESS"]')
+                # Force AUTO to exercise fallback through a controlled HTTP 204.
+                yaml=yaml.replace('server: "node.example.com"','server: "127.0.0.1"')
+                yaml=yaml.replace('    port: 443', f'    port: {free_port()}', 1).replace('    port: 443', f'    port: {udp_port}')
+                yaml=yaml.replace('https://www.gstatic.com/generate_204',f'http://127.0.0.1:{probe_port}/generate_204')
+                yaml=yaml.replace('interval: 120','interval: 1')
                 yaml=yaml.replace('    skip-cert-verify: false',f'    skip-cert-verify: false\n    fingerprint: "{pin}"')
                 path=root/'mihomo.yaml'
                 path.write_text(yaml,encoding='utf-8')
@@ -266,12 +279,22 @@ def smoke(sb, caddy, openssl, external=False, obfs='none',mihomo=None):
                     try:
                         with socket.create_connection(('127.0.0.1',mhport),timeout=.1): break
                     except OSError: time.sleep(.1)
-                with socks(mhport,'127.0.0.1',tcp_port) as raw:
-                    with context.wrap_socket(raw,server_hostname='node.example.com') as secure:
-                        secure.sendall(b'GET / HTTP/1.1\r\nHost: node.example.com\r\nConnection: close\r\n\r\n')
-                        res=http.client.HTTPResponse(secure);res.begin()
-                        assert res.status==200 and b'This site is online' in res.read()
-                print('Real Mihomo HY2 auth/TLS/data mode '+obfs+': PASS')
+                deadline = time.monotonic() + 12
+                while True:
+                    try:
+                        with socks(mhport, '127.0.0.1', tcp_port) as raw:
+                            raw.settimeout(2)
+                            with context.wrap_socket(raw, server_hostname='node.example.com') as secure:
+                                secure.sendall(b'GET / HTTP/1.1\r\nHost: node.example.com\r\nConnection: close\r\n\r\n')
+                                response = http.client.HTTPResponse(secure)
+                                response.begin()
+                                assert response.status == 200 and b'This site is online' in response.read()
+                        break
+                    except (OSError, EOFError):
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.25)
+                print(f"Real Mihomo AUTO fallback to authenticated HY2 ({obfs}): PASS")
             # A reachable local sentinel distinguishes rejection from a closed port.
             with socket.socket() as sentinel:
                 sentinel.bind(("127.0.0.1", 0))

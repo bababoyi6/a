@@ -7,6 +7,7 @@ from pathlib import Path
 import types
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 from argosbx import manager, model, network
 
@@ -25,6 +26,8 @@ class DualTests(unittest.TestCase):
         self.assertEqual([(x["type"], x["listen_port"]) for x in server["inbounds"]],
                          [("vless", 443), ("hysteria2", 443)])
         self.assertEqual(server["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision")
+        self.assertTrue(server["inbounds"][0]["tcp_fast_open"])
+        self.assertNotIn("tcp_fast_open", server["inbounds"][1])
         self.assertEqual(model.subscription(node), f'https://node.example.com:8443/s/{node["token"]}')
         exports = model.exports(node)
         links = base64.b64decode(exports["shadowrocket.txt"]).decode().splitlines()
@@ -33,15 +36,38 @@ class DualTests(unittest.TestCase):
         self.assertIn(node["password"], links[1])
         self.assertEqual([link.rsplit("#", 1)[1] for link in links], ["VLESS", "Hysteria2"])
         self.assertEqual([x["type"] for x in json.loads(exports["singbox.json"])["outbounds"]],
-                         ["vless", "hysteria2"])
+                         ["vless", "hysteria2", "vless"])
         self.assertIn("packet-encoding: xudp", exports["clash.yaml"])
         self.assertIn('proxies: ["VLESS", "Hysteria2"]', exports["clash.yaml"])
+        self.assertIn('proxies: ["AUTO", "VLESS", "VLESS Fast Open", "Hysteria2"]', exports["clash.yaml"])
+        self.assertIn('    tfo: true\n', exports["clash.yaml"])
+        self.assertIn("name: AUTO\n    type: fallback", exports["clash.yaml"])
         self.assertNotIn("url-test", exports["clash.yaml"])
         client = json.loads(exports["singbox.json"])
-        self.assertEqual([item["tag"] for item in client["outbounds"]], ["VLESS", "Hysteria2"])
+        self.assertEqual([item["tag"] for item in client["outbounds"]], ["VLESS", "Hysteria2", "VLESS Fast Open"])
+        normal, _, fast_open = client["outbounds"]
+        self.assertEqual(fast_open, {**normal, "tag": "VLESS Fast Open", "tcp_fast_open": True})
         self.assertEqual(client["route"]["final"], "VLESS")
         self.assertEqual(model.exports({**node, "name": "我的 HY2"}), exports)
         self.assertNotIn(node["token"], "".join(exports.values()))
+
+    def test_fixed_endpoint_keeps_tls_names_and_subscription(self):
+        fixed = {**self.node, "endpoint_ip": "1.1.1.1"}
+        self.assertEqual(model.subscription(fixed), model.subscription(self.node))
+        self.assertEqual(model.server_config(fixed), model.server_config(self.node))
+        self.assertEqual(model.caddy_config(fixed), model.caddy_config(self.node))
+        for build_uri, sni in ((model.vless_uri, "addons.mozilla.org"), (model.uri, self.node["domain"])):
+            url = urlsplit(build_uri(fixed))
+            self.assertEqual(url.hostname, fixed["endpoint_ip"])
+            self.assertEqual(parse_qs(url.query)["sni"], [sni])
+        for fixed_out, domain_out in zip(model.client_config(fixed)["outbounds"],
+                                         model.client_config(self.node)["outbounds"]):
+            self.assertEqual(fixed_out, {**domain_out, "server": fixed["endpoint_ip"]})
+        self.assertEqual(model.clash_config(fixed), model.clash_config(self.node).replace(
+            f'server: "{self.node["domain"]}"', f'server: "{fixed["endpoint_ip"]}"'))
+        for address in ("127.0.0.1", "100.64.0.1", "224.0.0.1", "8.8.8.08", "::1"):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                model.endpoint_ipv4(address)
 
     def test_reinstall_uses_existing_node_without_repair(self):
         current = MagicMock()
@@ -49,12 +75,12 @@ class DualTests(unittest.TestCase):
         with patch.object(manager, "CURRENT", current), patch.object(manager, "current", return_value=current), \
              patch.object(manager, "read_json", return_value=self.node), \
              patch.object(manager, "probe"), \
-             patch.object(manager, "apt_policy"), patch.object(manager, "set_units"), \
-             patch.object(manager, "enable_units"), patch.object(manager, "current_exports", return_value=True), \
              patch.object(manager, "pending_caddy_update", return_value=None), \
+             patch.object(manager, "apt_policy"), patch.object(manager, "set_units", return_value=set()), \
+             patch.object(manager, "enable_units"), patch.object(manager, "current_exports", return_value=True), \
              patch.object(manager, "preflight", side_effect=AssertionError("reinstall changed system")), \
              patch.object(manager, "subscription", return_value="existing"):
-            self.assertEqual(manager.install(types.SimpleNamespace(obfs=None, arch="amd64")), "existing")
+            self.assertEqual(manager.install(types.SimpleNamespace(obfs=None)), "existing")
 
     def test_qr_encoder_receives_exact_subscription_url(self):
         output = io.StringIO()
