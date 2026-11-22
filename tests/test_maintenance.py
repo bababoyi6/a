@@ -61,21 +61,80 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(issue.call_args.args[0], pending)
         self.assertFalse((self.root / "pending.json").exists())
 
-    def test_existing_upgrade_regenerates_exports_without_rotating(self):
+    def test_existing_upgrade_updates_stale_generation_without_rotating(self):
         save(self.stage / "node.json", {**self.node, "name": "我的 HY2"})
+        expected_server = model.server_config(self.node)
+        stale_server = model.server_config(self.node)
+        del stale_server["inbounds"][0]["tcp_fast_open"]
         changed = self.root / "candidate"
         with patch.object(manager, "CURRENT", self.stage), patch.object(Path, "is_symlink", return_value=True), \
                 patch.object(manager, "current", return_value=self.stage), patch.object(manager, "probe"), \
-                patch.object(manager, "pending_caddy_update", return_value=None), \
+                patch.object(manager, "pending_engine_updates", return_value={}), \
                 patch.object(manager, "apt_policy"), patch.object(manager, "set_units", return_value=set()), \
                 patch.object(manager, "enable_units"), \
                 patch.object(manager, "copy_generation", return_value=changed), patch.object(manager, "write_generation") as write, \
-                patch.object(manager, "activate") as activate, patch.object(manager, "subscription"):
-            manager.install(types.SimpleNamespace(obfs=None))
-        deployed = write.call_args.args[1]
-        self.assertEqual(deployed, {**self.node, "name": "我的 HY2"})
-        self.assertEqual(model.subscription(deployed), model.subscription(self.node))
-        activate.assert_called_once()
+                patch.object(manager, "activate") as activate, patch.object(manager, "subscription"), \
+                patch.object(manager, "current_exports") as exports:
+            cases = ((expected_server, False), (stale_server, True))
+            for config, export_matches in cases:
+                with self.subTest(export_matches=export_matches):
+                    save(self.stage / "server.json", config)
+                    exports.return_value = export_matches
+                    write.reset_mock()
+                    activate.reset_mock()
+                    manager.install(types.SimpleNamespace(obfs=None))
+                    deployed = write.call_args.args[1]
+                    self.assertEqual(deployed, {**self.node, "name": "我的 HY2"})
+                    self.assertEqual(model.subscription(deployed), model.subscription(self.node))
+                    activate.assert_called_once()
+
+    def test_guard_with_valid_digest_still_requires_current_policy(self):
+        payload = {"nftables": [{"table": {"family": "inet", "name": "argosbx_hy2"}}]}
+        state = {"guard_owned": True, "guard_digest": maintenance.firewall_digest(payload)}
+        path = self.root / "firewall.json"
+        with patch.object(manager, "run", return_value=result(json.dumps(payload))):
+            save(path, state)
+            with self.assertRaisesRegex(manager.Error, "需要更新"):
+                manager.verify_firewall()
+            save(path, {**state, "guard_policy": manager.GUARD_POLICY_VERSION})
+            manager.verify_firewall()
+
+    def test_stage_installs_only_pinned_engine_upgrades(self):
+        installed = {"sing-box": "v1.14.3", "caddy": "v2.11.10", "lego": "v4.32.0"}
+        save(self.stage / "versions.json", installed)
+        updates = manager.pending_engine_updates(self.stage)
+        self.assertEqual(list(updates), ["sing-box"])
+        with patch.object(manager, "root_platform", return_value="amd64"), \
+                patch.object(manager.releases, "install_binary") as download:
+            manager.stage_engine_updates(self.stage, updates)
+        download.assert_called_once_with(updates["sing-box"]["assets"]["amd64"], "sing-box",
+                                         self.stage / "bin/sing-box", self.root / "cache")
+        self.assertEqual(manager.read_json(self.stage / "versions.json"), {**installed, "sing-box": "v1.14.4"})
+
+    def test_proxy_probe_stops_before_forwarding_if_client_never_listens(self):
+        save(self.stage / "node.json", self.node)
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.poll.return_value = None
+        with patch.object(manager, "atomic"), patch.object(manager.subprocess, "Popen", return_value=client), \
+                patch.object(manager.socket, "create_connection", side_effect=ConnectionRefusedError), \
+                patch.object(manager.time, "sleep"), patch.object(manager, "run") as forward:
+            with self.assertRaisesRegex(manager.Error, "未及时就绪"):
+                manager.proxy_probe(self.stage)
+        forward.assert_not_called()
+        client.terminate.assert_called_once()
+
+    def test_protocol_health_reports_high_loss_only_when_enabled(self):
+        save(self.stage / "node.json", self.node)
+        with patch.object(manager, "local_public_ip", return_value=None), patch.object(manager, "proxy_probe") as probe:
+            self.assertEqual(list(manager.protocol_health(self.stage)), ["vless", "hy2"])
+            save(self.stage / "node.json", {**self.node, "endpoint_ip": "1.1.1.1",
+                                            "vless_udp_rate": {"up_mbps": 12, "down_mbps": 30}})
+            probe.side_effect = [None, None, manager.Error("optional path failed")]
+            protocols = manager.protocol_health(self.stage)
+        self.assertEqual(protocols["vless"]["data"], "DATA_OK")
+        self.assertEqual(protocols["hy2"]["data"], "DATA_OK")
+        self.assertEqual(protocols["vless-rate"]["data"], "EXTERNAL_UNKNOWN")
 
     def test_invalid_install_options_are_rejected_before_platform_access(self):
         with patch.object(manager, "root_platform") as platform:

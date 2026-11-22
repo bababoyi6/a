@@ -37,6 +37,7 @@ APT_MARKER = "// Managed by ArgoSBX-HY2\n"
 APT_KEYS = ("APT::Periodic::Unattended-Upgrade", "APT::Periodic::Update-Package-Lists",
             "APT::Periodic::Download-Upgradeable-Packages")
 RENEW_WINDOW = 30 * 86400
+GUARD_POLICY_VERSION = 2
 
 
 class Error(RuntimeError):
@@ -585,7 +586,11 @@ def guard_rules(uid, resolvers):
     v4 = ", ".join(x for x in model.BLOCKED if ":" not in x)
     v6 = ", ".join(x for x in model.BLOCKED if ":" in x)
     lines += [f"meta skuid {uid} ip daddr {{ {v4} }} reject",
-              f"meta skuid {uid} ip6 daddr {{ {v6} }} reject", "}", "}"]
+              f"meta skuid {uid} ip6 daddr {{ {v6} }} reject"]
+    # Linux routes locally assigned addresses via lo. Keep the two public IPv4
+    # paths used by the VLESS carrier and the HTTPS data check.
+    lines += [f'oifname "lo" meta skuid {uid} meta nfproto ipv4 tcp dport {{ 443, 8443 }} accept',
+              f'oifname "lo" meta skuid {uid} reject', "}", "}"]
     return "\n".join(lines) + "\n"
 
 
@@ -611,10 +616,13 @@ def firewall():
     # A single nft transaction: there is no empty-table window.
     run(["nft", "-c", "-f", "-"], input=script)
     state["guard_owned"] = True
+    state.pop("guard_digest", None)
+    state.pop("guard_policy", None)
     save(owned, state)
     run(["nft", "-f", "-"], input=script)
     payload = json.loads(run(["nft", "-j", "list", "table", "inet", "argosbx_hy2"]).stdout)
     state["guard_digest"] = maintenance.firewall_digest(payload)
+    state["guard_policy"] = GUARD_POLICY_VERSION
     save(owned, state)
 
 
@@ -623,6 +631,8 @@ def verify_firewall():
     result = run(["nft", "-j", "list", "table", "inet", "argosbx_hy2"], check=False)
     if result.returncode or not state.get("guard_owned") or not state.get("guard_digest"):
         raise Error("私网防护规则缺失或尚未登记完整性，请运行 argosbx repair")
+    if state.get("guard_policy") != GUARD_POLICY_VERSION:
+        raise Error("代理防护规则需要更新，请运行 argosbx repair")
     if maintenance.firewall_digest(json.loads(result.stdout)) != state["guard_digest"]:
         raise Error("私网防护规则不完整，请运行 argosbx repair")
 
@@ -766,6 +776,8 @@ def proxy_probe(stage, target_ip=None, protocol="hy2", check_private=True):
                             break
                     except OSError:
                         time.sleep(0.1)
+                else:
+                    raise Error("本地代理测试客户端未及时就绪")
                 proxy = f"socks5h://127.0.0.1:{port}"
                 # A public address assigned to this VPS gives a complete local
                 # HY2/TLS/data test without depending on an external website.
@@ -935,23 +947,23 @@ def reality_keypair(binary):
     return private[1], public[1]
 
 
-def pending_caddy_update(deployment):
-    installed = read_json(deployment / "versions.json")["caddy"]
+def pending_engine_updates(deployment):
+    installed = read_json(deployment / "versions.json")
     lockdata = read_json(APP / "dependencies.lock.json")
     releases.validate_lock(lockdata)
-    dependency = lockdata["dependencies"]["caddy"]
-    if releases.version_tuple(installed) < releases.version_tuple(dependency["version"]):
-        return dependency
-    return None
+    dependencies = lockdata["dependencies"]
+    return {binary: dependencies[binary] for binary in ("sing-box", "caddy")
+            if releases.version_tuple(installed[binary]) < releases.version_tuple(dependencies[binary]["version"])}
 
 
-def stage_caddy_update(stage, dependency):
-    if dependency is None:
+def stage_engine_updates(stage, updates):
+    if not updates:
         return
-    spec = dependency["assets"][root_platform()]
-    releases.install_binary(spec, "caddy", stage / "bin/caddy", DATA / "cache")
+    arch = root_platform()
     versions = read_json(stage / "versions.json")
-    versions["caddy"] = dependency["version"]
+    for binary, dependency in updates.items():
+        releases.install_binary(dependency["assets"][arch], binary, stage / "bin" / binary, DATA / "cache")
+        versions[binary] = dependency["version"]
     save(stage / "versions.json", versions)
 
 
@@ -963,7 +975,7 @@ def install(args):
             raise Error("发现旧版节点；不自动迁移或覆盖")
         if args.obfs is not None and args.obfs != node.get("obfs", "none"):
             raise Error("已安装；请用 argosbx obfs 显式切换混淆模式")
-        caddy_update = pending_caddy_update(old)
+        updates = pending_engine_updates(old)
         apt_policy()
         changed = set_units()
         force = set(SERVICES).intersection(changed)
@@ -975,9 +987,14 @@ def install(args):
             print("现有节点异常，尝试修复本项目服务。")
             repair(force=force)
         else:
-            if caddy_update or force or not current_exports(old, node):
+            try:
+                deployed_server = read_json(old / "server.json")
+            except json.JSONDecodeError:
+                deployed_server = None
+            if (updates or force or deployed_server != model.server_config(node)
+                    or not current_exports(old, node)):
                 stage = copy_generation(old)
-                stage_caddy_update(stage, caddy_update)
+                stage_engine_updates(stage, updates)
                 write_generation(stage, node, old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
                 activate(stage, read_json(STATE), force=force)
         enable_units(changed)
@@ -1129,7 +1146,7 @@ def rollback():
     if ({key: value for key, value in oldnode.items() if key not in non_credentials} !=
             {key: value for key, value in newnode.items() if key not in non_credentials}):
         raise Error("上一版本含旧凭据；为避免恢复已撤销密码，不能普通回滚，请使用 repair 或再次 rotate")
-    if pending_caddy_update(stage):
+    if "caddy" in pending_engine_updates(stage):
         raise Error("上一版本的 Caddy 低于当前安全版本，拒绝回滚")
     if not current_exports(stage, newnode):
         original = stage
@@ -1197,7 +1214,7 @@ def repair(force=()):
     old = current()
     state = read_json(STATE)
     stage = copy_generation(old)
-    stage_caddy_update(stage, pending_caddy_update(old))
+    stage_engine_updates(stage, pending_engine_updates(old))
     write_generation(stage, read_json(old / "node.json"), old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
     try:
         verify_firewall()
@@ -1402,7 +1419,10 @@ def protocol_health(stage):
     except Exception:
         target_ip = None
     results = {}
-    for protocol in ("vless", "hy2"):
+    protocols = ["vless", "hy2"]
+    if read_json(stage / "node.json", {}).get("vless_udp_rate"):
+        protocols.append("vless-rate")
+    for protocol in protocols:
         try:
             proxy_probe(stage, target_ip=target_ip, protocol=protocol, check_private=False)
             results[protocol] = {"transport": "TRANSPORT_OK", "data": "DATA_OK"}

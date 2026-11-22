@@ -100,9 +100,9 @@ class DualTests(unittest.TestCase):
         current = MagicMock()
         current.is_symlink.return_value = True
         with patch.object(manager, "CURRENT", current), patch.object(manager, "current", return_value=current), \
-             patch.object(manager, "read_json", return_value=self.node), \
+             patch.object(manager, "read_json", side_effect=[self.node, model.server_config(self.node)]), \
              patch.object(manager, "probe"), \
-             patch.object(manager, "pending_caddy_update", return_value=None), \
+             patch.object(manager, "pending_engine_updates", return_value={}), \
              patch.object(manager, "apt_policy"), patch.object(manager, "set_units", return_value=set()), \
              patch.object(manager, "enable_units"), patch.object(manager, "current_exports", return_value=True), \
              patch.object(manager, "preflight", side_effect=AssertionError("reinstall changed system")), \
