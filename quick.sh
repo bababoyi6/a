@@ -2,8 +2,8 @@
 # Fetch a fixed AAA release over HTTPS and authenticate it before execution.
 set -Eeuo pipefail
 umask 077
-archive_url='https://github.com/bababoyi6/a/releases/download/v0.3.4/argosbx-hy2-v0.3.4.tar.gz'
-archive_sha256='6b2e9cf30749f4c52aa1cd562d198b8038a166096165c1f776eac80df0623fe4'
+archive_url='https://github.com/bababoyi6/a/releases/download/v0.3.5/argosbx-hy2-v0.3.5.tar.gz'
+archive_sha256='ed4717811019bc84c283aaccd0468993d3b886aa3d21080bad60e28874f62d1a'
 if [[ ! "$archive_url" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/ ]] ||
    [[ ! "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]; then
   printf '%s\n' '远程安装入口尚未发布。请从已审查的源码目录运行 sudo bash install.sh。' >&2
