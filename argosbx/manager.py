@@ -738,17 +738,20 @@ def probe(stage, public=False):
 
 
 def proxy_probe(stage, target_ip=None, protocol="hy2", check_private=True):
-    """Exercise both real client handshakes and data forwarding."""
+    """Exercise a real client path and verify data forwarding."""
     node = read_json(stage / "node.json")
     config = model.client_config(node)
-    if protocol == "hy2":
-        config["outbounds"] = [config["outbounds"][1]]
-        config["route"]["final"] = model.HYSTERIA2
+    final = {"hy2": model.HYSTERIA2, "vless": model.VLESS, "vless-rate": model.VLESS_UDP}[protocol]
+    outbounds = {item["tag"]: item for item in config["outbounds"]}
+    selected = outbounds[final]
+    carrier = outbounds[selected["detour"]] if "detour" in selected else selected
+    carrier["server"] = "127.0.0.1"
+    config["outbounds"] = [selected, carrier] if carrier is not selected else [selected]
+    config["route"]["final"] = final
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     config["inbounds"][0]["listen_port"] = port
-    config["outbounds"][0]["server"] = "127.0.0.1"
     with tempfile.TemporaryDirectory(prefix="proxy-check-", dir=DATA) as temp:
         path = Path(temp) / "client.json"
         atomic(path, json.dumps(config))
@@ -842,7 +845,10 @@ def activate(stage, state, public=False, force=()):
         # sites/DNS. NAT-only hosts retain the explicit external fallback probe.
         if SERVICES[0] in targets:
             target_ip = local_public_ip()
-            for protocol in ("vless", "hy2"):
+            protocols = ["vless", "hy2"]
+            if read_json(stage / "node.json", {}).get("vless_udp_rate"):
+                protocols.append("vless-rate")
+            for protocol in protocols:
                 proxy_probe(stage, target_ip=target_ip, protocol=protocol)
         if public:
             try:
@@ -1119,7 +1125,7 @@ def rollback():
     # Never restore revoked credentials through an ordinary binary rollback.
     oldnode = read_json(current() / "node.json")
     newnode = read_json(stage / "node.json")
-    non_credentials = {"name", "endpoint_ip"}
+    non_credentials = {"name", "endpoint_ip", "vless_udp_rate"}
     if ({key: value for key, value in oldnode.items() if key not in non_credentials} !=
             {key: value for key, value in newnode.items() if key not in non_credentials}):
         raise Error("上一版本含旧凭据；为避免恢复已撤销密码，不能普通回滚，请使用 repair 或再次 rotate")
@@ -1267,10 +1273,29 @@ def set_endpoint(value):
         node["endpoint_ip"] = address
     else:
         node.pop("endpoint_ip")
+    node.pop("vless_udp_rate", None)
     stage = copy_generation(old)
     write_generation(stage, node, old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
     activate(stage, read_json(STATE))
     print("客户端节点地址已更新，请刷新原订阅。")
+
+
+def set_vless_rate(args):
+    old = current()
+    node = read_json(old / "node.json")
+    rate = {"down_mbps": args.download, "up_mbps": args.upload} if args.mode == "on" else None
+    if rate == node.get("vless_udp_rate"):
+        print("VLESS 高丢包配置已是所选状态。")
+        return
+    if rate:
+        node["vless_udp_rate"] = rate
+    else:
+        node.pop("vless_udp_rate")
+    model.validate_node(node)
+    stage = copy_generation(old)
+    write_generation(stage, node, old / "tls/fullchain.pem", old / "tls/key.pem", read_json(old / "ua.json", []))
+    activate(stage, read_json(STATE))
+    print("VLESS 高丢包配置已更新，请刷新原订阅。")
 
 
 def add_ua(args):
@@ -1586,6 +1611,10 @@ def main(argv=None):
     diag.add_argument("--seconds", type=int, default=10, help="采样秒数，1–120")
     endpoint = sub.add_parser("endpoint", help="固定客户端连接 IPv4，或恢复通过域名连接")
     endpoint.add_argument("address", metavar="IPv4|domain")
+    acceleration = sub.add_parser("vless-rate", help="开关并设置 VLESS 高丢包档的目标速率")
+    acceleration.add_argument("mode", choices=("on", "off"))
+    acceleration.add_argument("--download", type=int, metavar="MBPS")
+    acceleration.add_argument("--upload", type=int, metavar="MBPS")
     rot = sub.add_parser("rotate")
     rot.add_argument("kind", choices=["token", "password", "both"], default="both", nargs="?")
     transport = sub.add_parser("obfs", help="切换传输模式，保留订阅地址；客户端需要刷新")
@@ -1601,6 +1630,12 @@ def main(argv=None):
         ins.error("不支持 --name 或 --token-file；节点名固定，证书仅使用 HTTP-01")
     if args.command == "netdiag" and not 1 <= args.seconds <= 120:
         diag.error("--seconds 必须在 1–120 之间")
+    if args.command == "vless-rate":
+        speeds = (args.download, args.upload)
+        if args.mode == "on" and any(value is None or not 1 <= value <= 1000 for value in speeds):
+            acceleration.error("开启时须设置 --download 和 --upload，单位为 Mbps，范围 1–1000")
+        if args.mode == "off" and any(value is not None for value in speeds):
+            acceleration.error("关闭时无需速率参数")
     had_current = CURRENT.is_symlink()
     try:
         args.arch = root_platform()
@@ -1653,6 +1688,8 @@ def main(argv=None):
                 set_obfuscation(args.mode)
             elif command == "endpoint":
                 set_endpoint(args.address)
+            elif command == "vless-rate":
+                set_vless_rate(args)
             elif command == "add-ua":
                 add_ua(args)
             elif command == "uninstall":

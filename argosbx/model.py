@@ -10,6 +10,9 @@ from urllib.parse import quote
 ROOT = "/etc/argosbx-hy2/current"
 VLESS = "VLESS"
 VLESS_FAST_OPEN = "VLESS Fast Open"
+VLESS_UDP = "VLESS over UDP"
+VLESS_HIGH_LOSS = "VLESS High Loss"
+HY2_RATE = "Hysteria2 Rate"
 HYSTERIA2 = "Hysteria2"
 AUTO = "AUTO"
 # Explicitly includes multicast, CGNAT, documentation, mapped IPv4 and metadata.
@@ -52,6 +55,13 @@ def validate_node(node):
         raise ValueError("元数据域名必须使用规范形式")
     if "endpoint_ip" in node and endpoint_ipv4(node["endpoint_ip"]) != node["endpoint_ip"]:
         raise ValueError("节点 IPv4 必须使用规范形式")
+    if "vless_udp_rate" in node:
+        rate = node["vless_udp_rate"]
+        if "endpoint_ip" not in node:
+            raise ValueError("高丢包线路需要固定 VPS 公网 IPv4")
+        if (not isinstance(rate, dict) or set(rate) != {"up_mbps", "down_mbps"} or
+                any(type(value) is not int or not 1 <= value <= 1000 for value in rate.values())):
+            raise ValueError("高丢包线路的上传和下载目标速率须为 1–1000 Mbps 的整数")
     for key in ("password", "token"):
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", node[key]):
             raise ValueError(f"无效的 {key}（要求 32 字节随机值）")
@@ -117,6 +127,9 @@ def uri(node):
 
 def server_config(node, root=ROOT):
     validate_node(node)
+    rate = node.get("vless_udp_rate")
+    bandwidth = ({"up_mbps": rate["down_mbps"], "down_mbps": rate["up_mbps"]} if rate
+                 else {"ignore_client_bandwidth": True})
     return {
         "log": {"level": "error", "timestamp": True},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
@@ -130,7 +143,7 @@ def server_config(node, root=ROOT):
                                           "short_id": [node["short_id"]]}}},
                      {"type": "hysteria2", "tag": "hy2-in", "listen": "0.0.0.0",
                       "listen_port": 443, "users": [{"name": "personal", "password": node["password"]}],
-                      "ignore_client_bandwidth": True, **obfuscation(node),
+                      **bandwidth, **obfuscation(node),
                       "tls": {"enabled": True, "server_name": node["domain"],
                               "certificate_path": f"{root}/tls/fullchain.pem",
                               "key_path": f"{root}/tls/key.pem"},
@@ -154,15 +167,19 @@ def vless_outbound(node, endpoint, tag):
 def client_config(node):
     validate_node(node)
     endpoint = node.get("endpoint_ip", node["domain"])
+    hy2 = {"type": "hysteria2", "tag": HYSTERIA2, "server": endpoint, "server_port": 443,
+           "password": node["password"], **obfuscation(node),
+           "tls": {"enabled": True, "server_name": node["domain"], "insecure": False}}
+    outbounds = [vless_outbound(node, endpoint, VLESS), hy2,
+                 {**vless_outbound(node, endpoint, VLESS_FAST_OPEN), "tcp_fast_open": True}]
+    if rate := node.get("vless_udp_rate"):
+        outbounds.extend([{**hy2, **rate, "tag": HY2_RATE},
+                          {**vless_outbound(node, endpoint, VLESS_UDP), "detour": HY2_RATE}])
     return {
         "log": {"level": "warn"},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": [{"type": "mixed", "tag": "local-in", "listen": "127.0.0.1", "listen_port": 7890}],
-        "outbounds": [vless_outbound(node, endpoint, VLESS),
-                      {"type": "hysteria2", "tag": HYSTERIA2, "server": endpoint,
-                       "server_port": 443, "password": node["password"], **obfuscation(node),
-                       "tls": {"enabled": True, "server_name": node["domain"], "insecure": False}},
-                      {**vless_outbound(node, endpoint, VLESS_FAST_OPEN), "tcp_fast_open": True}],
+        "outbounds": outbounds,
         "route": {"default_domain_resolver": "local", "final": VLESS},
     }
 
@@ -175,14 +192,14 @@ def clash_config(node):
     obfs = ('    obfs: salamander\n    obfs-password: ' + q(node["obfs_password"]) + '\n'
             if node.get("obfs") == "salamander" else '')
 
-    def vless_proxy(name, tfo=""):
+    def vless_proxy(name, options=""):
         return f'''  - name: "{name}"
     type: vless
     server: {endpoint}
     port: 443
     uuid: {q(node["uuid"])}
     network: tcp
-{tfo}    udp: true
+{options}    udp: true
     packet-encoding: xudp
     tls: true
     servername: addons.mozilla.org
@@ -193,7 +210,36 @@ def clash_config(node):
     flow: xtls-rprx-vision
 '''
 
-    fast_open = vless_proxy(VLESS_FAST_OPEN, "    tfo: true\n")
+    def hy2_proxy(name, options=""):
+        return f'''  - name: "{name}"
+    type: hysteria2
+    server: {endpoint}
+    port: 443
+    password: {q(node["password"])}
+{options}{obfs}    sni: {q(node["domain"])}
+    skip-cert-verify: false
+'''
+
+    def fallback(name, primary, secondary):
+        return f'''  - name: {q(name)}
+    type: fallback
+    proxies: [{q(primary)}, {q(secondary)}]
+    url: https://www.gstatic.com/generate_204
+    expected-status: 204
+    interval: 120
+    timeout: 5000
+    max-failed-times: 2
+    lazy: true
+'''
+
+    proxies = vless_proxy(VLESS) + hy2_proxy(HYSTERIA2) + vless_proxy(VLESS_FAST_OPEN, "    tfo: true\n")
+    choices = [AUTO, VLESS, VLESS_FAST_OPEN, HYSTERIA2]
+    groups = fallback(AUTO, VLESS, HYSTERIA2)
+    if rate := node.get("vless_udp_rate"):
+        proxies += hy2_proxy(HY2_RATE, f'    up: {rate["up_mbps"]}\n    down: {rate["down_mbps"]}\n')
+        proxies += vless_proxy(VLESS_UDP, f"    dialer-proxy: {q(HY2_RATE)}\n")
+        choices.insert(1, VLESS_HIGH_LOSS)
+        groups += fallback(VLESS_HIGH_LOSS, VLESS_UDP, VLESS)
     return f'''# ArgoSBX-HY2 — Mihomo; local mixed proxy at 127.0.0.1:7890
 mixed-port: 7890
 allow-lan: false
@@ -211,27 +257,11 @@ dns:
   proxy-server-nameserver: [https://dns.alidns.com/dns-query, https://doh.pub/dns-query]
   nameserver: [https://1.1.1.1/dns-query, https://8.8.8.8/dns-query]
 proxies:
-{vless_proxy(VLESS)}  - name: "{HYSTERIA2}"
-    type: hysteria2
-    server: {endpoint}
-    port: 443
-    password: {q(node["password"])}
-{obfs}    sni: {q(node["domain"])}
-    skip-cert-verify: false
-{fast_open}proxy-groups:
+{proxies}proxy-groups:
   - name: PROXY
     type: select
-    proxies: ["{AUTO}", "{VLESS}", "{VLESS_FAST_OPEN}", "{HYSTERIA2}"]
-  - name: {AUTO}
-    type: fallback
-    proxies: ["{VLESS}", "{HYSTERIA2}"]
-    url: https://www.gstatic.com/generate_204
-    expected-status: 204
-    interval: 120
-    timeout: 5000
-    max-failed-times: 2
-    lazy: true
-rules:
+    proxies: {q(choices)}
+{groups}rules:
   - MATCH,PROXY
 '''
 

@@ -90,6 +90,8 @@ def smoke(sb, caddy, openssl, external=False, obfs="none", mihomo=None):
         pair = subprocess.run([sb, "generate", "reality-keypair"], check=True, capture_output=True, text=True).stdout
         node = model.new_node("node.example.com", re.search(r"PrivateKey:\s*(\S+)", pair)[1],
                               re.search(r"PublicKey:\s*(\S+)", pair)[1])
+        if mihomo:
+            node.update(endpoint_ip="1.1.1.1", vless_udp_rate={"up_mbps": 12, "down_mbps": 30})
         if obfs == "salamander":
             node.update(obfs=obfs, obfs_password=secrets.token_urlsafe(32))
         tcp_port, udp_port, local_port, vless_port = free_port(), free_port(socket.SOCK_DGRAM), free_port(), free_port()
@@ -121,7 +123,8 @@ def smoke(sb, caddy, openssl, external=False, obfs="none", mihomo=None):
         server["route"]["rules"].insert(1, {"ip_cidr": ["127.0.0.1/32"], "port": tcp_port,
                                            "action": "route", "outbound": "direct"})
         if mihomo:
-            server["route"]["rules"].insert(1, {"ip_cidr": ["127.0.0.1/32"], "port": probe_port,
+            server["route"]["rules"].insert(1, {"ip_cidr": ["127.0.0.1/32"],
+                                               "port": [probe_port, server["inbounds"][0]["listen_port"]],
                                                "action": "route", "outbound": "direct"})
         server['route']['rules'].insert(1, {'ip_cidr': ['127.0.0.1/32'], 'port': echo_port,
                                            'action': 'route', 'outbound': 'direct'})
@@ -260,41 +263,68 @@ def smoke(sb, caddy, openssl, external=False, obfs="none", mihomo=None):
             print('Real HY2 wrong password, wrong SNI and untrusted CA rejection: PASS')
             print('Real VLESS wrong UUID and REALITY short_id rejection: PASS')
             if mihomo:
-                mhport=free_port()
                 # Test-only CA pin verifies chain/name without changing system trust.
-                pin=hashlib.sha256(ssl.PEM_cert_to_DER_cert(ca.read_text())).hexdigest()
-                yaml=model.clash_config(node).replace('mixed-port: 7890',f'mixed-port: {mhport}')
-                # Force AUTO to exercise fallback through a controlled HTTP 204.
-                yaml=yaml.replace('server: "node.example.com"','server: "127.0.0.1"')
-                yaml=yaml.replace('    port: 443', f'    port: {free_port()}', 1).replace('    port: 443', f'    port: {udp_port}')
-                yaml=yaml.replace('https://www.gstatic.com/generate_204',f'http://127.0.0.1:{probe_port}/generate_204')
-                yaml=yaml.replace('interval: 120','interval: 1')
-                yaml=yaml.replace('    skip-cert-verify: false',f'    skip-cert-verify: false\n    fingerprint: "{pin}"')
-                path=root/'mihomo.yaml'
-                path.write_text(yaml,encoding='utf-8')
-                mh=subprocess.Popen([mihomo,'-d',str(root/'mihomo'),'-f',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-                processes.append(mh)
-                for _ in range(50):
-                    if mh.poll() is not None: raise RuntimeError('Mihomo runtime fixture exited')
-                    try:
-                        with socket.create_connection(('127.0.0.1',mhport),timeout=.1): break
-                    except OSError: time.sleep(.1)
-                deadline = time.monotonic() + 12
-                while True:
-                    try:
-                        with socks(mhport, '127.0.0.1', tcp_port) as raw:
-                            raw.settimeout(2)
-                            with context.wrap_socket(raw, server_hostname='node.example.com') as secure:
-                                secure.sendall(b'GET / HTTP/1.1\r\nHost: node.example.com\r\nConnection: close\r\n\r\n')
-                                response = http.client.HTTPResponse(secure)
-                                response.begin()
-                                assert response.status == 200 and b'This site is online' in response.read()
-                        break
-                    except (OSError, EOFError):
-                        if time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.25)
+                pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(ca.read_text())).hexdigest()
+                template = model.clash_config(node).replace('server: "1.1.1.1"', 'server: "127.0.0.1"')
+                template = template.replace('https://www.gstatic.com/generate_204',
+                                            f'http://127.0.0.1:{probe_port}/generate_204')
+                template = template.replace('interval: 120', 'interval: 1').replace('timeout: 5000', 'timeout: 1000')
+                template = template.replace('    skip-cert-verify: false',
+                                            f'    skip-cert-verify: false\n    fingerprint: "{pin}"')
+                reality_port = server["inbounds"][0]["listen_port"]
+
+                def mihomo_request(label, ports, policy, should_connect=True):
+                    mhport = free_port()
+                    yaml = template.replace('mixed-port: 7890', f'mixed-port: {mhport}')
+                    yaml = yaml.replace('  - MATCH,PROXY', f'  - MATCH,{policy}')
+                    pieces = yaml.split('    port: 443\n')
+                    assert len(pieces) == len(ports) + 1
+                    yaml = pieces[0] + ''.join(f'    port: {port}\n{part}' for port, part in zip(ports, pieces[1:]))
+                    path = root / f'{label}.yaml'
+                    path.write_text(yaml, encoding='utf-8')
+                    mh = subprocess.Popen([mihomo, '-d', str(root / label), '-f', str(path)],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    processes.append(mh)
+                    for _ in range(50):
+                        if mh.poll() is not None:
+                            raise RuntimeError(f'Mihomo runtime fixture exited ({label})')
+                        try:
+                            with socket.create_connection(('127.0.0.1', mhport), timeout=.1):
+                                break
+                        except OSError:
+                            time.sleep(.1)
+                    else:
+                        raise RuntimeError(f'Mihomo runtime fixture never listened ({label})')
+                    deadline = time.monotonic() + 12
+                    while True:
+                        try:
+                            with socks(mhport, '127.0.0.1', tcp_port) as raw:
+                                raw.settimeout(2)
+                                with context.wrap_socket(raw, server_hostname='node.example.com') as secure:
+                                    secure.sendall(b'GET / HTTP/1.1\r\nHost: node.example.com\r\nConnection: close\r\n\r\n')
+                                    response = http.client.HTTPResponse(secure)
+                                    response.begin()
+                                    assert response.status == 200 and b'This site is online' in response.read()
+                            assert should_connect, "VLESS UDP unexpectedly bypassed its failed carrier"
+                            break
+                        except (OSError, EOFError):
+                            if not should_connect:
+                                break
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.25)
+                    mh.terminate()
+                    mh.wait(timeout=5)
+
+                unavailable = free_port(socket.SOCK_DGRAM)
+                mihomo_request("hy2-fallback", [free_port(), udp_port, reality_port, udp_port, reality_port], "PROXY")
                 print(f"Real Mihomo AUTO fallback to authenticated HY2 ({obfs}): PASS")
+                mihomo_request("vless-udp", [reality_port, udp_port, reality_port, udp_port, reality_port], model.VLESS_UDP)
+                mihomo_request("carrier-offline", [reality_port, udp_port, reality_port, unavailable, reality_port],
+                               model.VLESS_UDP, should_connect=False)
+                mihomo_request("tcp-fallback", [reality_port, udp_port, reality_port, unavailable, reality_port],
+                               model.VLESS_HIGH_LOSS)
+                print("Real Mihomo VLESS over authenticated UDP and TCP fallback: PASS")
             # A reachable local sentinel distinguishes rejection from a closed port.
             with socket.socket() as sentinel:
                 sentinel.bind(("127.0.0.1", 0))

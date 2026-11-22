@@ -41,7 +41,7 @@ class DualTests(unittest.TestCase):
         self.assertIn('proxies: ["VLESS", "Hysteria2"]', exports["clash.yaml"])
         self.assertIn('proxies: ["AUTO", "VLESS", "VLESS Fast Open", "Hysteria2"]', exports["clash.yaml"])
         self.assertIn('    tfo: true\n', exports["clash.yaml"])
-        self.assertIn("name: AUTO\n    type: fallback", exports["clash.yaml"])
+        self.assertIn('name: "AUTO"\n    type: fallback', exports["clash.yaml"])
         self.assertNotIn("url-test", exports["clash.yaml"])
         client = json.loads(exports["singbox.json"])
         self.assertEqual([item["tag"] for item in client["outbounds"]], ["VLESS", "Hysteria2", "VLESS Fast Open"])
@@ -68,6 +68,33 @@ class DualTests(unittest.TestCase):
         for address in ("127.0.0.1", "100.64.0.1", "224.0.0.1", "8.8.8.08", "::1"):
             with self.subTest(address=address), self.assertRaises(ValueError):
                 model.endpoint_ipv4(address)
+
+    def test_high_loss_profile_reuses_ports_and_keeps_tcp_fallback(self):
+        rate = {"up_mbps": 12, "down_mbps": 30}
+        with self.assertRaises(ValueError):
+            model.validate_node({**self.node, "vless_udp_rate": rate})
+        node = {**self.node, "endpoint_ip": "1.1.1.1", "vless_udp_rate": rate}
+        inbounds = model.server_config(node)["inbounds"]
+        original = model.server_config(self.node)["inbounds"]
+        self.assertEqual(inbounds[0], original[0])
+        hy2 = inbounds[1]
+        self.assertEqual(hy2["listen_port"], original[1]["listen_port"])
+        self.assertEqual((hy2["up_mbps"], hy2["down_mbps"]), (30, 12))
+        self.assertNotIn("ignore_client_bandwidth", hy2)
+        client = model.client_config(node)
+        self.assertEqual(client["route"]["final"], model.VLESS)
+        outbounds = {item["tag"]: item for item in client["outbounds"]}
+        self.assertEqual(outbounds[model.VLESS_UDP]["detour"], model.HY2_RATE)
+        self.assertEqual((outbounds[model.HY2_RATE]["up_mbps"], outbounds[model.HY2_RATE]["down_mbps"]), (12, 30))
+        self.assertNotIn("up_mbps", outbounds[model.HYSTERIA2])
+        config = model.clash_config(node)
+        self.assertIn('dialer-proxy: "Hysteria2 Rate"', config)
+        self.assertIn('proxies: ["VLESS over UDP", "VLESS"]', config)
+        self.assertIn('proxies: ["VLESS", "Hysteria2"]', config)
+        self.assertEqual(model.exports(node)["shadowrocket.txt"],
+                         model.exports({**self.node, "endpoint_ip": "1.1.1.1"})["shadowrocket.txt"])
+        with self.assertRaises(ValueError):
+            model.validate_node({**node, "vless_udp_rate": {"up_mbps": True, "down_mbps": 30}})
 
     def test_reinstall_uses_existing_node_without_repair(self):
         current = MagicMock()
